@@ -1,0 +1,520 @@
+#XGBoost SMOTE MICE
+
+library(xgboost)
+library(data.table)
+library(Matrix)
+library(ModelMetrics)
+library(caret)
+library(pROC)
+library(mice)      
+library(dplyr)     
+library(recipes)   
+library(themis)    
+library(SHAPforxgboost)
+library(ggplot2)
+
+# Load data
+data <- fread("Y:/Tyler Zander/NSQIP/Z4_NSQIP_2018_2021V10.csv")
+
+# Save 'CaseID' and 'RACE_COMBINED_NUM'
+case_id <- data$CaseID
+race_combined_num <- data$RACE_COMBINED_NUM
+
+# Remove saved variables
+data[, CaseID := NULL]
+data[, RACE_COMBINED_NUM := NULL]
+
+# Define numerical and categorical variables
+numerical_features <- c("WORKRVU", "Age", "HEIGHT", "WEIGHT", "PRSODM", "PRBUN", "PRCREAT", 
+                        "PRWBC", "PRHCT", "PRPLATE", "MORTPROB", "MORBPROB", 
+                        "OPTIME", "HtoODay", "DOptoDis", "ASACLAS", 
+                        "TOTAL_WRVU", "Additional_CPT_Count")
+
+# Determine categorical variables
+categorical_features <- setdiff(names(data), c(numerical_features, "UNPLANNEDREADMISSION1"))
+
+# Convert to data frame
+data <- as.data.frame(data)
+
+# Convert categorical variables
+data[categorical_features] <- lapply(data[categorical_features], as.factor)
+data$UNPLANNEDREADMISSION1 <- as.factor(data$UNPLANNEDREADMISSION1)
+
+# Create folds for cross-validation
+set.seed(42)
+folds <- createFolds(data$UNPLANNEDREADMISSION1, k = 5, list = TRUE, returnTrain = FALSE)
+
+# Lists for results
+all_predictions <- list()
+all_actual <- list()
+all_test_data <- list()
+all_val_predictions <- list()
+all_val_actual <- list()
+all_metrics <- list()
+all_val_metrics <- list()   
+
+# Platt Scaling
+platt_scale <- function(predictions, actual) {
+  # Fit Platt model
+  df <- data.frame(pred = predictions, actual = actual)
+  platt_model <- glm(actual ~ pred, family = binomial(), data = df)
+  return(platt_model)
+}
+
+apply_platt_scaling <- function(predictions, platt_model) {
+  # Apply Platt scaling
+  df <- data.frame(pred = predictions)
+  calibrated_probs <- predict(platt_model, newdata = df, type = "response")
+  return(calibrated_probs)
+}
+
+# Calculate metrics
+calculate_metrics <- function(predictions, actual, threshold) {
+  predicted_classes <- ifelse(predictions > threshold, 1, 0)
+  
+  # Create confusion matrix
+  confusion_matrix <- table(
+    factor(actual, levels = c(0, 1)),
+    factor(predicted_classes, levels = c(0, 1))
+  )
+  
+  tp <- if(nrow(confusion_matrix) == 2 && ncol(confusion_matrix) == 2) confusion_matrix[2,2] else 0
+  fp <- if(nrow(confusion_matrix) == 2 && ncol(confusion_matrix) == 2) confusion_matrix[1,2] else 0
+  tn <- if(nrow(confusion_matrix) == 2 && ncol(confusion_matrix) == 2) confusion_matrix[1,1] else 0
+  fn <- if(nrow(confusion_matrix) == 2 && ncol(confusion_matrix) == 2) confusion_matrix[2,1] else 0
+  
+  accuracy <- (tp + tn) / sum(confusion_matrix)
+  specificity <- ifelse((tn + fp) > 0, tn / (tn + fp), NA)
+  recall <- ifelse((tp + fn) > 0, tp / (tp + fn), NA)
+  precision <- ifelse((tp + fp) > 0, tp / (tp + fp), NA)
+  f1_score <- ifelse((precision + recall) > 0, 2 * (precision * recall) / (precision + recall), NA)
+  auc_value <- auc(actual, predictions)
+  brier_score <- mean((predictions - actual)^2)
+  
+  return(c(Accuracy = accuracy, 
+           Specificity = specificity,
+           Recall = recall,
+           Precision = precision,
+           F1_Score = f1_score,
+           AUC = auc_value,
+           Brier_Score = brier_score))
+}
+
+# Find optimal threshold
+find_optimal_threshold <- function(predictions, actual) {
+  thresholds <- seq(0.1, 0.9, by = 0.01)
+  f1_scores <- sapply(thresholds, function(thresh) {
+    pred_classes <- ifelse(predictions > thresh, 1, 0)
+    conf_matrix <- table(
+      factor(actual, levels = c(0, 1)),
+      factor(pred_classes, levels = c(0, 1))
+    )
+    
+    tp <- if(nrow(conf_matrix) == 2 && ncol(conf_matrix) == 2) conf_matrix[2,2] else 0
+    fp <- if(nrow(conf_matrix) == 2 && ncol(conf_matrix) == 2) conf_matrix[1,2] else 0
+    fn <- if(nrow(conf_matrix) == 2 && ncol(conf_matrix) == 2) conf_matrix[2,1] else 0
+    
+    precision <- ifelse((tp + fp) > 0, tp / (tp + fp), 0)
+    recall <- ifelse((tp + fn) > 0, tp / (tp + fn), 0)
+    f1 <- ifelse((precision + recall) > 0, 2 * (precision * recall) / (precision + recall), 0)
+    return(f1)
+  })
+  return(thresholds[which.max(f1_scores)])
+}
+
+# 5-fold cross-validation
+for (i in 1:5) {
+  # Set seed
+  set.seed(42 + i)
+  
+  # CV
+  test_indices <- folds[[i]]
+  val_indices <- folds[[(i %% 5) + 1]]  # Next fold is validation
+  train_indices <- unlist(folds[-c(i, (i %% 5) + 1)])  # Remaining folds are training
+  
+  # Split data
+  train_data <- data[train_indices,]
+  val_data <- data[val_indices,]
+  test_data <- data[test_indices,]
+  
+  # Perform MICE 
+  print(paste("Fold", i, "- Running MICE imputation..."))
+  mice_mod <- mice(train_data, m = 5, method = "pmm", printFlag = FALSE)
+  train_data_imputed <- complete(mice_mod, 1)
+  
+  # Apply MICE
+  val_data_imputed <- complete(mice.mids(mice_mod, newdata = val_data), 1)
+  test_data_imputed <- complete(mice.mids(mice_mod, newdata = test_data), 1)
+  
+  # Print class distribution before SMOTE
+  cat(sprintf("\nFold %d - Class distribution before SMOTE:\n", i))
+  print(table(train_data_imputed$UNPLANNEDREADMISSION1))
+  
+  # Preprocessing with SMOTE
+  print(paste("Fold", i, "- Applying SMOTE..."))
+  rec_obj <- recipe(UNPLANNEDREADMISSION1 ~ ., data = train_data_imputed) %>%
+    step_smotenc(UNPLANNEDREADMISSION1, 
+                 neighbors = 5, 
+                 over_ratio = 0.25)  # Create fewer synthetic samples, as in LightGBM code
+  
+  # Apply SMOTE
+  train_data_balanced <- prep(rec_obj) %>% juice()
+  
+  # Print class distribution after SMOTE
+  cat(sprintf("Fold %d - Class distribution after SMOTE:\n", i))
+  print(table(train_data_balanced$UNPLANNEDREADMISSION1))
+  
+  # Prepare data for XGBoost
+  train_data_balanced_xgb <- train_data_balanced
+  train_data_balanced_xgb[categorical_features] <- lapply(train_data_balanced_xgb[categorical_features], as.numeric)
+  train_data_balanced_xgb$UNPLANNEDREADMISSION1 <- as.numeric(train_data_balanced_xgb$UNPLANNEDREADMISSION1) - 1
+  
+  val_data_xgb <- val_data_imputed
+  val_data_xgb[categorical_features] <- lapply(val_data_xgb[categorical_features], as.numeric)
+  val_data_xgb$UNPLANNEDREADMISSION1 <- as.numeric(val_data_xgb$UNPLANNEDREADMISSION1) - 1
+  
+  
+  test_data_xgb <- test_data_imputed
+  test_data_xgb[categorical_features] <- lapply(test_data_xgb[categorical_features], as.numeric)
+  test_data_xgb$UNPLANNEDREADMISSION1 <- as.numeric(test_data_xgb$UNPLANNEDREADMISSION1) - 1
+  
+  
+  # Calculate scale_pos_weight
+  positive_cases <- sum(train_data_balanced_xgb$UNPLANNEDREADMISSION1 == 1)
+  negative_cases <- sum(train_data_balanced_xgb$UNPLANNEDREADMISSION1 == 0)
+  scale_pos_weight_val <- negative_cases / positive_cases
+  
+  # Create XGBoost matrix
+  dtrain <- xgb.DMatrix(data = as.matrix(train_data_balanced_xgb[, !names(train_data_balanced_xgb) %in% "UNPLANNEDREADMISSION1"]), 
+                        label = train_data_balanced_xgb$UNPLANNEDREADMISSION1)
+  dval <- xgb.DMatrix(data = as.matrix(val_data_xgb[, !names(val_data_xgb) %in% "UNPLANNEDREADMISSION1"]), 
+                      label = val_data_xgb$UNPLANNEDREADMISSION1)
+  
+  # Set parameters for XGBoost
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = c("auc", "logloss"),
+    scale_pos_weight = scale_pos_weight_val,  
+    eta = 0.01,              
+    max_depth = 4,            
+    min_child_weight = 40,    
+    subsample = 0.8,          
+    colsample_bytree = 0.8,   
+    colsample_bylevel = 0.8,  
+    alpha = 0.1,             
+    lambda = 1.0,             
+    tree_method = "hist",     
+    max_bin = 256,            
+    min_split_loss = 1,       
+    base_score = mean(train_data_balanced_xgb$UNPLANNEDREADMISSION1)
+  )
+  
+  # Train the model
+  print(paste("Fold", i, "- Training XGBoost model..."))
+  watchlist <- list(train = dtrain, valid = dval)
+  model <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 1000,
+    watchlist = watchlist,
+    early_stopping_rounds = 50,
+    print_every_n = 100
+  )
+  
+  # Make predictions
+  val_predictions_raw <- predict(model, dval)
+  test_predictions_raw <- predict(model, xgb.DMatrix(data = as.matrix(test_data_xgb[, !names(test_data_xgb) %in% "UNPLANNEDREADMISSION1"])))
+  
+  # Fit Platt scaling
+  platt_model <- platt_scale(val_predictions_raw, val_data_xgb$UNPLANNEDREADMISSION1)
+  
+  # Apply Platt scaling
+  val_predictions <- apply_platt_scaling(val_predictions_raw, platt_model)
+  test_predictions <- apply_platt_scaling(test_predictions_raw, platt_model)
+  
+  # Find optimal threshold
+  val_threshold <- find_optimal_threshold(val_predictions, val_data_xgb$UNPLANNEDREADMISSION1)
+  
+  # Calculate validation metrics
+  val_metrics <- calculate_metrics(val_predictions, val_data_xgb$UNPLANNEDREADMISSION1, val_threshold)
+  
+  # Store validation results
+  all_val_predictions[[i]] <- val_predictions
+  all_val_actual[[i]] <- val_data_xgb$UNPLANNEDREADMISSION1
+  all_val_metrics[[i]] <- val_metrics
+  
+  # Calculate test metrics using validation threshold
+  test_metrics <- calculate_metrics(test_predictions, test_data_xgb$UNPLANNEDREADMISSION1, val_threshold)
+  
+  # Store results
+  all_predictions[[i]] <- test_predictions
+  all_actual[[i]] <- test_data_xgb$UNPLANNEDREADMISSION1
+  all_test_data[[i]] <- test_data_xgb
+  all_metrics[[i]] <- test_metrics
+  
+  # Fold results
+  cat(sprintf("\nFold %d Validation Results:\n", i))
+  print(val_metrics)
+  cat(sprintf("\nFold %d Test Results:\n", i))
+  print(test_metrics)
+}
+
+# Calculate average validation metrics across folds
+avg_val_metrics <- Reduce(`+`, all_val_metrics) / length(all_val_metrics)
+cat("\nAverage Validation Metrics Across All Folds:\n")
+print(avg_val_metrics)
+
+# Calculate standard deviations for validation metrics
+sd_val_metrics <- sqrt(Reduce(`+`, lapply(all_val_metrics, function(x) (x - avg_val_metrics)^2)) / (length(all_val_metrics) - 1))
+cat("\nStandard Deviations of Validation Metrics Across Folds:\n")
+print(sd_val_metrics)
+
+# Calculate average test metrics across folds
+avg_test_metrics <- Reduce(`+`, all_metrics) / length(all_metrics)
+cat("\nAverage Test Metrics Across All Folds:\n")
+print(avg_test_metrics)
+
+# Calculate standard deviations for test metrics
+sd_test_metrics <- sqrt(Reduce(`+`, lapply(all_metrics, function(x) (x - avg_test_metrics)^2)) / (length(all_metrics) - 1))
+cat("\nStandard Deviations of Test Metrics Across Folds:\n")
+print(sd_test_metrics)
+
+# Compare validation vs test metrics
+metrics_comparison <- data.frame(
+  Metric = names(avg_val_metrics),
+  Validation_Mean = avg_val_metrics,
+  Validation_SD = sd_val_metrics,
+  Test_Mean = avg_test_metrics,
+  Test_SD = sd_test_metrics
+)
+
+cat("\nComparison of Validation and Test Metrics:\n")
+print(metrics_comparison)
+
+# Combine all predictions and actual outcomes
+combined_val_predictions <- unlist(all_val_predictions)
+combined_val_actual <- unlist(all_val_actual)
+combined_predictions <- unlist(all_predictions)
+combined_actual <- unlist(all_actual)
+
+# Calculate final metrics on combined results
+final_val_threshold <- find_optimal_threshold(combined_val_predictions, combined_val_actual)
+final_val_metrics <- calculate_metrics(combined_val_predictions, combined_val_actual, final_val_threshold)
+final_test_threshold <- find_optimal_threshold(combined_predictions, combined_actual)
+final_test_metrics <- calculate_metrics(combined_predictions, combined_actual, final_test_threshold)
+
+cat("\nFinal Combined Validation Metrics:\n")
+print(final_val_metrics)
+cat("\nFinal Combined Test Metrics:\n")
+print(final_test_metrics)
+
+# Calculate and print SMOTE info
+cat("\nSMOTE Synthesis Statistics:\n")
+for (i in 1:5) {
+
+  test_indices <- folds[[i]]
+  val_indices <- folds[[(i %% 5) + 1]]
+  train_indices <- unlist(folds[-c(i, (i %% 5) + 1)])
+  
+  train_data <- data[train_indices,]
+  
+  # Get counts after imputation
+  mice_mod <- mice(train_data, m = 1, printFlag = FALSE)
+  train_data_imputed <- complete(mice_mod)
+  original_counts <- table(train_data_imputed$UNPLANNEDREADMISSION1)
+  
+  # Get balanced counts
+  rec_obj <- recipe(UNPLANNEDREADMISSION1 ~ ., data = train_data_imputed) %>%
+    step_smotenc(UNPLANNEDREADMISSION1, neighbors = 5, over_ratio = 0.25)
+  
+  balanced_data <- prep(rec_obj) %>% juice()
+  balanced_counts <- table(balanced_data$UNPLANNEDREADMISSION1)
+  
+  # Calculate synthetic observations
+  synthetic_obs <- balanced_counts["1"] - original_counts["1"]
+  
+  cat(sprintf("\nFold %d:\n", i))
+  cat("Original class counts:\n")
+  print(original_counts)
+  cat("Balanced class counts:\n")
+  print(balanced_counts)
+  cat(sprintf("Number of synthetic observations created: %d\n", synthetic_obs))
+  cat(sprintf("Percentage increase: %.2f%%\n", (synthetic_obs/original_counts["1"]*100)))
+}
+
+
+# SHAP Analysis
+
+# Calculate SHAP values and importance for all folds
+cat("\n---------- CALCULATING SHAP VALUES FOR ALL FOLDS ----------\n")
+
+# List for SHAP
+all_shap_values <- list()
+all_shap_importance <- list()
+all_test_data_xgb <- list()
+
+# Loop through each fold to calculate SHAP values
+for (i in 1:5) {
+  cat(sprintf("\nCalculating SHAP values for Fold %d\n", i))
+  
+  test_data_for_shap <- all_test_data[[i]]
+  
+  all_test_data_xgb[[i]] <- test_data_for_shap
+  
+  feature_names <- names(test_data_for_shap)[!names(test_data_for_shap) %in% "UNPLANNEDREADMISSION1"] 
+  
+  # Calculate SHAP values
+  tryCatch({
+    # Create matrix
+    X <- as.matrix(test_data_for_shap[, !names(test_data_for_shap) %in% "UNPLANNEDREADMISSION1"])
+    
+    shap_result <- shap.values(xgb_model = model, X_train = X)
+    
+    shap_fold <- shap_result$shap_score
+    colnames(shap_fold) <- feature_names
+    all_shap_values[[i]] <- shap_fold
+    
+    # Calculate importances
+    importance_df <- data.frame(
+      variable = feature_names,
+      mean_abs_shap = colMeans(abs(shap_fold))
+    )
+    importance_df <- importance_df[order(-importance_df$mean_abs_shap), ]
+    all_shap_importance[[i]] <- importance_df
+    
+    # Print top features for folds
+    cat(sprintf("Top 10 important features for Fold %d:\n", i))
+    print(head(importance_df, 10))
+  }, error = function(e) {
+    cat(sprintf("Error calculating SHAP values for Fold %d: %s\n", i, e$message))
+  })
+}
+
+# Combine and calculate average importance across folds
+cat("\n---------- CALCULATING AVERAGE SHAP IMPORTANCE ----------\n")
+
+# Combine SHAP importance across all folds
+combined_importance <- data.frame()
+
+for (i in 1:length(all_shap_importance)) {
+  if (!is.null(all_shap_importance[[i]])) {
+    importance_df <- as.data.frame(all_shap_importance[[i]])
+    importance_df$fold <- i
+    combined_importance <- rbind(combined_importance, importance_df)
+  }
+}
+
+# Calculate average importance across folds
+avg_importance <- NULL
+if (nrow(combined_importance) > 0) {
+  avg_importance <- aggregate(mean_abs_shap ~ variable, data = combined_importance, FUN = mean)
+  avg_importance <- avg_importance[order(-avg_importance$mean_abs_shap), ]
+  
+  cat("\nAverage SHAP Feature Importance Across All Folds:\n")
+  print(avg_importance)
+  
+  # Select top features
+  top_10_features <- head(avg_importance$variable, 10)
+  cat("\nTop 10 Features Based on Average SHAP Importance:\n")
+  print(top_10_features)
+}
+
+# Save SHAP results
+saveRDS(all_shap_values, "xgboost_mice_smote_shap_values.rds")
+saveRDS(all_shap_importance, "xgboost_mice_smote_shap_importance.rds")
+saveRDS(avg_importance, "xgboost_mice_smote_avg_importance.rds")
+
+# Create a results directory
+dir.create("xgboost_smote_mice", showWarnings = FALSE)
+
+# Save all predictions and actual values
+saveRDS(all_predictions, "xgboost_smote_mice/test_predictions.rds")
+saveRDS(all_actual, "xgboost_smote_mice/test_actual.rds")
+saveRDS(all_val_predictions, "xgboost_smote_mice/val_predictions.rds")
+saveRDS(all_val_actual, "xgboost_smote_mice/val_actual.rds")
+
+# Save the combined predictions
+combined_data <- data.frame(
+  actual = combined_actual,
+  predicted = combined_predictions
+)
+write.csv(combined_data, "xgboost_smote_mice/combined_predictions.csv", row.names = FALSE)
+
+# Save all metrics
+saveRDS(all_metrics, "xgboost_smote_mice/test_metrics.rds")
+saveRDS(all_val_metrics, "xgboost_smote_mice/val_metrics.rds")
+
+# Save summary metrics
+metrics_summary <- data.frame(
+  metric = names(avg_test_metrics),
+  test_mean = avg_test_metrics,
+  test_sd = sd_test_metrics
+)
+write.csv(metrics_summary, "xgboost_smote_mice/metrics_summary.csv", row.names = FALSE)
+
+# Save metrics comparison
+write.csv(metrics_comparison, "xgboost_smote_mice/metrics_comparison.csv", row.names = FALSE)
+
+# Save SHAP results
+saveRDS(all_shap_values, "xgboost_smote_mice/shap_values.rds")
+saveRDS(all_shap_importance, "xgboost_smote_mice/shap_importance.rds")
+saveRDS(avg_importance, "xgboost_smote_mice/avg_shap_importance.rds")
+
+# Save best model from last fold (if needed)
+saveRDS(model, "xgboost_smote_mice/final_model.rds")
+
+# Save final thresholds
+thresholds <- data.frame(
+  type = c("validation", "test"),
+  threshold = c(final_val_threshold, final_test_threshold)
+)
+write.csv(thresholds, "xgboost_smote_mice/optimal_thresholds.csv", row.names = FALSE)
+
+# Save SMOTE info
+smote_stats <- data.frame()
+
+for (i in 1:5) {
+  # Get fold indices
+  test_indices <- folds[[i]]
+  val_indices <- folds[[(i %% 5) + 1]]
+  train_indices <- unlist(folds[-c(i, (i %% 5) + 1)])
+  
+  train_data <- data[train_indices,]
+  
+  # Get original counts after imputation
+  mice_mod <- mice(train_data, m = 1, printFlag = FALSE)
+  train_data_imputed <- complete(mice_mod)
+  original_counts <- table(train_data_imputed$UNPLANNEDREADMISSION1)
+  
+  # Get balanced counts
+  rec_obj <- recipe(UNPLANNEDREADMISSION1 ~ ., data = train_data_imputed) %>%
+    step_smotenc(UNPLANNEDREADMISSION1, neighbors = 5, over_ratio = 0.25)
+  
+  balanced_data <- prep(rec_obj) %>% juice()
+  balanced_counts <- table(balanced_data$UNPLANNEDREADMISSION1)
+  
+  # Calculate synthetic observations
+  synthetic_obs <- balanced_counts["1"] - original_counts["1"]
+  
+  # Add to dataframe
+  fold_stats <- data.frame(
+    fold = i,
+    original_class0 = as.numeric(original_counts["0"]),
+    original_class1 = as.numeric(original_counts["1"]),
+    balanced_class0 = as.numeric(balanced_counts["0"]),
+    balanced_class1 = as.numeric(balanced_counts["1"]),
+    synthetic_observations = synthetic_obs,
+    percentage_increase = (synthetic_obs/original_counts["1"]*100)
+  )
+  
+  smote_stats <- rbind(smote_stats, fold_stats)
+}
+
+write.csv(smote_stats, "xgboost_smote_mice/smote_statistics.csv", row.names = FALSE)
+
+# Save model parameters
+model_params <- data.frame(
+  parameter = names(params),
+  value = as.character(params)
+)
+write.csv(model_params, "xgboost_smote_mice/model_parameters.csv", row.names = FALSE)
