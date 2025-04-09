@@ -1,0 +1,1569 @@
+#XGBoost without SMOTE-NC
+
+library(xgboost)
+library(data.table)
+library(Matrix)
+library(ModelMetrics)
+library(caret)
+library(pROC)
+library(SHAPforxgboost)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+
+# Load data
+data <- fread("Y:/Tyler Zander/NSQIP/Z4_NSQIP_2018_2021V9.csv")
+
+# Save 'CaseID' for later use
+case_id <- data$CaseID
+data[, CaseID := NULL]
+
+# Rename variables
+setnames(data, 
+         old = c("MORBPROB", "OSSIPATOS", "DOptoDis", "InitialORGSPCSSI", "PRWBC", "SEPSISPATOS", 
+                 "MORTPROB", "PRCREAT", "OPTIME", "PRPLATE", "ASACLAS", "TOTAL_WRVU", "DOTHSYSEP"),
+         new = c("NSQIP Morbidity Probability", "Organ Space Infection PATOS", "Days from Operation to DC", 
+                 "Postop Organ Space Infection", "Preoperative WBC", "Sepsis PATOS", 
+                 "NSQIP Mortality Probability", "Preoperative Creatinine", "Operative Time", 
+                 "Preoperative Platelet Count", "ASA Class", "Total WRVU", "Days from Operation to Sepsis"))
+
+# Specify numerical and categorical variables
+numerical_features <- c("Age", "HEIGHT", "WEIGHT", "PRSODM", "PRBUN", "Preoperative Creatinine", "Preoperative WBC", 
+                        "PRHCT", "Preoperative Platelet Count", "PRALBUM", "PRBILI", "PRSGOT", "PRALKPH", "PRPTT", "PRINR", 
+                        "NSQIP Mortality Probability", "NSQIP Morbidity Probability", "Operative Time", "HtoODay", 
+                        "Days from Operation to DC", "ASA Class", "DSUPINFEC", "DWNDINFD", "DORGSPCSSI", 
+                        "DDEHIS", "DOUPNEUMO", "DREINTUB", "DPULEMBOL", "DFAILWEAN", 
+                        "DOPRENAFL", "DURNINFEC", "DCNSCVA", "DCDARREST", "DCDMI", 
+                        "DOTHBLEED", "DOTHDVT", "Days from Operation to Sepsis", "DOTHSESHOCK", "RETORPODAYS", 
+                        "Total WRVU", "WRVU", "Additional_CPT_Count")
+
+# Determine categorical variables
+categorical_features <- setdiff(names(data), c(numerical_features, "UNPLANNEDREADMISSION1"))
+
+# Convert categorical variables
+data[, (categorical_features) := lapply(.SD, function(x) as.integer(as.factor(x))), 
+     .SDcols = categorical_features]
+
+# Convert the target variable to binary
+data$UNPLANNEDREADMISSION1 <- as.numeric(as.factor(data$UNPLANNEDREADMISSION1)) - 1
+
+# Set up the target variable and features
+y <- data$UNPLANNEDREADMISSION1
+X <- as.matrix(data[, !"UNPLANNEDREADMISSION1", with = FALSE])
+
+# Print class distribution
+class_table <- table(y)
+print("Class distribution:")
+print(class_table)
+
+# Define nested cross-validation
+outer_folds <- 5
+inner_folds <- 3
+
+# Set seed for reproducibility
+set.seed(42)
+
+# Create outer fold
+outer_fold_indices <- createFolds(y, k = outer_folds, returnTrain = TRUE)
+
+# Function to calculate metrics
+calculate_metrics <- function(predictions, actual, threshold = 0.5) {
+  predicted_classes <- ifelse(predictions > threshold, 1, 0)
+  
+  # Create confusion matrix
+  confusion_matrix <- table(
+    factor(actual, levels = c(0, 1)),
+    factor(predicted_classes, levels = c(0, 1))
+  )
+  
+  tp <- if(nrow(confusion_matrix) == 2 && ncol(confusion_matrix) == 2) confusion_matrix[2,2] else 0
+  fp <- if(nrow(confusion_matrix) == 2 && ncol(confusion_matrix) == 2) confusion_matrix[1,2] else 0
+  tn <- if(nrow(confusion_matrix) == 2 && ncol(confusion_matrix) == 2) confusion_matrix[1,1] else 0
+  fn <- if(nrow(confusion_matrix) == 2 && ncol(confusion_matrix) == 2) confusion_matrix[2,1] else 0
+  
+  accuracy <- (tp + tn) / sum(confusion_matrix)
+  specificity <- tn / (tn + fp)
+  recall <- tp / (tp + fn)
+  precision <- tp / (tp + fp)
+  f1_score <- 2 * (precision * recall) / (precision + recall)
+  auc_value <- auc(actual, predictions)
+  brier_score <- mean((predictions - actual)^2)
+  
+  return(c(Accuracy = accuracy, 
+           Specificity = specificity,
+           Recall = recall,
+           Precision = precision,
+           F1_Score = f1_score,
+           AUC = auc_value,
+           Brier_Score = brier_score))
+}
+
+# Find F1 maximizing threshold
+find_optimal_threshold <- function(predictions, actual) {
+  thresholds <- seq(0.1, 0.9, by = 0.01)
+  f1_scores <- sapply(thresholds, function(thresh) {
+    pred_classes <- ifelse(predictions > thresh, 1, 0)
+    conf_matrix <- table(
+      factor(actual, levels = c(0, 1)),
+      factor(pred_classes, levels = c(0, 1))
+    )
+    
+    tp <- if(nrow(conf_matrix) == 2 && ncol(conf_matrix) == 2) conf_matrix[2,2] else 0
+    fp <- if(nrow(conf_matrix) == 2 && ncol(conf_matrix) == 2) conf_matrix[1,2] else 0
+    fn <- if(nrow(conf_matrix) == 2 && ncol(conf_matrix) == 2) conf_matrix[2,1] else 0
+    precision <- tp / (tp + fp)
+    recall <- tp / (tp + fn)
+    f1 <- 2 * (precision * recall) / (precision + recall)
+    return(f1)
+  })
+  return(thresholds[which.max(f1_scores)])
+}
+
+# Platt scaling 
+platt_scale <- function(predictions, actual) {
+  # Fit Platt scaling
+  df <- data.frame(pred = predictions, actual = actual)
+  platt_model <- glm(actual ~ pred, family = binomial(), data = df)
+  return(platt_model)
+}
+
+apply_platt_scaling <- function(predictions, platt_model) {
+  # Apply Platt scaling
+  df <- data.frame(pred = predictions)
+  calibrated_probs <- predict(platt_model, newdata = df, type = "response")
+  return(calibrated_probs)
+}
+
+# Calibration data
+create_calibration_curve <- function(predictions, actual, bins = 10) {
+  # Sort predictions and create equal-sized bins
+  sorted_data <- data.frame(pred = predictions, actual = actual)
+  sorted_data <- sorted_data[order(sorted_data$pred), ]
+  
+  n <- length(predictions)
+  bin_size <- ceiling(n / bins)
+  
+  calibration_data <- data.frame(
+    bin = integer(),
+    pred_mean = numeric(),
+    actual_mean = numeric(),
+    lower_bound = numeric(),
+    upper_bound = numeric(),
+    n_samples = integer()
+  )
+  
+  for (i in 1:bins) {
+    start_idx <- (i-1) * bin_size + 1
+    end_idx <- min(i * bin_size, n)
+    
+    if (start_idx > n) break
+    
+    bin_data <- sorted_data[start_idx:end_idx, ]
+    n_samples <- nrow(bin_data)
+    
+    if (n_samples > 0) {
+      pred_mean <- mean(bin_data$pred)
+      actual_mean <- mean(bin_data$actual)
+      
+      # Calculate confidence intervals
+      if (n_samples >= 5) {
+        ci <- binom.test(sum(bin_data$actual), n_samples)$conf.int
+        lower_bound <- ci[1]
+        upper_bound <- ci[2]
+      } else {
+        lower_bound <- NA
+        upper_bound <- NA
+      }
+      
+      calibration_data <- rbind(
+        calibration_data,
+        data.frame(
+          bin = i,
+          pred_mean = pred_mean,
+          actual_mean = actual_mean,
+          lower_bound = lower_bound,
+          upper_bound = upper_bound,
+          n_samples = n_samples
+        )
+      )
+    }
+  }
+  
+  return(calibration_data)
+}
+
+# Calibration evaluation
+plot_calibration_curve <- function(original_cal_data, calibrated_cal_data, title = "Calibration Curve") {
+  # Combine data for plotting
+  original_cal_data$type <- "Original"
+  calibrated_cal_data$type <- "Calibrated"
+  combined_data <- rbind(original_cal_data, calibrated_cal_data)
+  
+  # Plot
+  p <- ggplot() +
+    # Add reference line
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+    
+    # Add curves
+    geom_line(data = combined_data, 
+              aes(x = pred_mean, y = actual_mean, color = type), 
+              size = 1) +
+    
+    # Add confidence intervals
+    geom_ribbon(data = combined_data, 
+                aes(x = pred_mean, ymin = lower_bound, ymax = upper_bound, fill = type),
+                alpha = 0.2) +
+    
+    # Add points
+    geom_point(data = combined_data, 
+               aes(x = pred_mean, y = actual_mean, color = type, size = n_samples)) +
+    
+    # Labels and theme
+    scale_color_manual(values = c("Original" = "red", "Calibrated" = "blue")) +
+    scale_fill_manual(values = c("Original" = "red", "Calibrated" = "blue")) +
+    labs(
+      title = title,
+      x = "Predicted Probability",
+      y = "Observed Frequency",
+      color = "Model",
+      fill = "Model",
+      size = "Sample Size"
+    ) +
+    theme_minimal() +
+    coord_equal() +  # Force 1:1 aspect ratio
+    xlim(0, 1) +
+    ylim(0, 1)
+  
+  return(p)
+}
+
+# Predictions
+get_cv_preds <- function(X_data, y_data, params, nrounds, nfolds = 5) {
+  # Create folds for cross-validation
+  set.seed(42)
+  folds <- createFolds(y_data, k = nfolds, returnTrain = TRUE)
+  
+  # Store out-of-fold predictions
+  oof_preds <- numeric(length(y_data))
+  
+  for (i in 1:nfolds) {
+    # Get train and validation
+    train_idx <- folds[[i]]
+    valid_idx <- setdiff(1:length(y_data), train_idx)
+    
+    # Create training and validation matrix
+    dtrain <- xgb.DMatrix(data = X_data[train_idx, ], label = y_data[train_idx])
+    dvalid <- xgb.DMatrix(data = X_data[valid_idx, ], label = y_data[valid_idx])
+    
+    # Train model
+    model <- xgb.train(
+      params = params,
+      data = dtrain,
+      nrounds = nrounds,
+      verbose = 0
+    )
+    
+    # Get out-of-fold predictions
+    oof_preds[valid_idx] <- predict(model, dvalid)
+  }
+  
+  return(oof_preds)
+}
+
+# Hyperparameter grid
+param_grid <- expand.grid(
+  eta = c(0.01, 0.05),
+  max_depth = c(4, 6),
+  min_child_weight = c(40, 60),
+  subsample = c(0.8),
+  colsample_bytree = c(0.8),
+  colsample_bylevel = c(0.8),
+  alpha = c(0.1),
+  lambda = c(1.0)
+)
+
+# Results
+outer_fold_results <- list()
+best_models <- list()
+best_platt_models <- list()
+test_predictions <- list()
+test_actual <- list()
+shap_values_all <- list()
+shap_importance_all <- list()
+# NEW: For calibration curves
+original_pred_all <- list()
+calibration_curves <- list()
+
+cat("\n---------- NESTED CROSS-VALIDATION ----------\n")
+
+# Start nested cross-validation
+for (outer_fold in 1:outer_folds) {
+  cat(sprintf("\n===== Outer Fold %d/%d =====\n", outer_fold, outer_folds))
+  
+  # Split outer folds
+  outer_train_idx <- outer_fold_indices[[outer_fold]]
+  outer_test_idx <- setdiff(1:length(y), outer_train_idx)
+  
+  X_outer_train <- X[outer_train_idx, ]
+  y_outer_train <- y[outer_train_idx]
+  X_outer_test <- X[outer_test_idx, ]
+  y_outer_test <- y[outer_test_idx]
+  
+  # Calculate class weight for imbalance
+  positive_cases <- sum(y_outer_train == 1)
+  negative_cases <- sum(y_outer_train == 0)
+  scale_pos_weight_val <- negative_cases / positive_cases
+  
+  # Create inner folds
+  inner_fold_indices <- createFolds(y_outer_train, k = inner_folds, returnTrain = TRUE)
+  
+  # Inner cross-validation for tuning
+  inner_results <- data.frame()
+  
+  for (param_set in 1:nrow(param_grid)) {
+    cat(sprintf("\nTesting parameter set %d/%d...\n", param_set, nrow(param_grid)))
+    
+    current_params <- list(
+      objective = "binary:logistic",
+      eval_metric = c("auc", "logloss"),
+      scale_pos_weight = scale_pos_weight_val * 1.0,
+      eta = param_grid$eta[param_set],
+      max_depth = param_grid$max_depth[param_set],
+      min_child_weight = param_grid$min_child_weight[param_set],
+      subsample = param_grid$subsample[param_set],
+      colsample_bytree = param_grid$colsample_bytree[param_set],
+      colsample_bylevel = param_grid$colsample_bylevel[param_set],
+      alpha = param_grid$alpha[param_set],
+      lambda = param_grid$lambda[param_set],
+      tree_method = "hist",
+      max_bin = 256,
+      min_split_loss = 1,
+      base_score = mean(y_outer_train)
+    )
+    
+    # Track errors
+    inner_fold_metrics <- matrix(NA, nrow = inner_folds, ncol = 7)
+    inner_fold_iterations <- numeric(inner_folds)
+    
+    for (inner_fold in 1:inner_folds) {
+      # Get inner train and validation
+      inner_train_idx <- inner_fold_indices[[inner_fold]]
+      inner_valid_idx <- setdiff(1:length(y_outer_train), inner_train_idx)
+      
+      # Create matrix for inner training and validation
+      X_inner_train <- X_outer_train[inner_train_idx, ]
+      y_inner_train <- y_outer_train[inner_train_idx]
+      X_inner_valid <- X_outer_train[inner_valid_idx, ]
+      y_inner_valid <- y_outer_train[inner_valid_idx]
+      
+      # Create DMatrix objects
+      dtrain_inner <- xgb.DMatrix(data = X_inner_train, label = y_inner_train)
+      dvalid_inner <- xgb.DMatrix(data = X_inner_valid, label = y_inner_valid)
+      
+      # Train with early stopping
+      watchlist <- list(train = dtrain_inner, valid = dvalid_inner)
+      inner_model <- xgb.train(
+        params = current_params,
+        data = dtrain_inner,
+        nrounds = 1000,
+        watchlist = watchlist,
+        early_stopping_rounds = 50,
+        print_every_n = 100,
+        verbose = 0
+      )
+      
+      # Record best iteration
+      inner_fold_iterations[inner_fold] <- inner_model$best_iteration
+      
+      # Get validation predictions
+      inner_val_preds <- predict(inner_model, dvalid_inner)
+      
+      # Apply Platt scaling
+      inner_platt_model <- platt_scale(inner_val_preds, y_inner_valid)
+      inner_val_preds_calibrated <- apply_platt_scaling(inner_val_preds, inner_platt_model)
+      
+      # Calculate optimal threshold
+      optimal_threshold <- find_optimal_threshold(inner_val_preds_calibrated, y_inner_valid)
+      
+      # Calculate metrics
+      metrics <- calculate_metrics(inner_val_preds_calibrated, y_inner_valid, optimal_threshold)
+      inner_fold_metrics[inner_fold, ] <- metrics
+    }
+    
+    # Average inner fold metrics
+    avg_metrics <- colMeans(inner_fold_metrics, na.rm = TRUE)
+    avg_iterations <- round(mean(inner_fold_iterations))
+    
+    # Store parameters
+    inner_results <- rbind(
+      inner_results,
+      data.frame(
+        param_set = param_set,
+        eta = param_grid$eta[param_set],
+        max_depth = param_grid$max_depth[param_set],
+        min_child_weight = param_grid$min_child_weight[param_set],
+        subsample = param_grid$subsample[param_set],
+        colsample_bytree = param_grid$colsample_bytree[param_set],
+        colsample_bylevel = param_grid$colsample_bylevel[param_set],
+        alpha = param_grid$alpha[param_set],
+        lambda = param_grid$lambda[param_set],
+        iterations = avg_iterations,
+        accuracy = avg_metrics[1],
+        specificity = avg_metrics[2],
+        recall = avg_metrics[3],
+        precision = avg_metrics[4],
+        f1_score = avg_metrics[5],
+        auc = avg_metrics[6],
+        brier_score = avg_metrics[7]
+      )
+    )
+    
+    cat(sprintf("Parameter set %d - Avg AUC: %.4f, Avg F1: %.4f, Avg Iterations: %d\n", 
+                param_set, avg_metrics[6], avg_metrics[5], avg_iterations))
+  }
+  
+  # Find best parameters
+  best_params_idx <- which.max(inner_results$auc)
+  best_inner_params <- inner_results[best_params_idx, ]
+  
+  cat("\nBest parameters for outer fold:", outer_fold, "\n")
+  print(best_inner_params[, 2:9])
+  
+  # Train final model
+  best_params <- list(
+    objective = "binary:logistic",
+    eval_metric = c("auc", "logloss"),
+    scale_pos_weight = scale_pos_weight_val * 1.0,
+    eta = best_inner_params$eta,
+    max_depth = best_inner_params$max_depth,
+    min_child_weight = best_inner_params$min_child_weight,
+    subsample = best_inner_params$subsample,
+    colsample_bytree = best_inner_params$colsample_bytree,
+    colsample_bylevel = best_inner_params$colsample_bylevel,
+    alpha = best_inner_params$alpha,
+    lambda = best_inner_params$lambda,
+    tree_method = "hist",
+    max_bin = 256,
+    min_split_loss = 1,
+    base_score = mean(y_outer_train)
+  )
+  
+  # Create final outer training matrix
+  dtrain_outer <- xgb.DMatrix(data = X_outer_train, label = y_outer_train)
+  dtest_outer <- xgb.DMatrix(data = X_outer_test, label = y_outer_test)
+  
+  # Train final model for outer fold
+  final_model <- xgb.train(
+    params = best_params,
+    data = dtrain_outer,
+    nrounds = best_inner_params$iterations,
+    verbose = 1
+  )
+  
+  # Get cross-validated predictions
+  cv_train_preds <- get_cv_preds(
+    X_data = X_outer_train,
+    y_data = y_outer_train,
+    params = best_params,
+    nrounds = best_inner_params$iterations,
+    nfolds = 5
+  )
+  
+  # Fit Platt scaling model
+  platt_model <- platt_scale(cv_train_preds, y_outer_train)
+  
+  # Get predictions on test set
+  test_preds_raw <- predict(final_model, dtest_outer)
+  
+  # Apply Platt scaling
+  test_preds_calibrated <- apply_platt_scaling(test_preds_raw, platt_model)
+  
+  # Store original predictions
+  original_pred_all[[outer_fold]] <- test_preds_raw
+  
+  # Create calibration curves
+  original_cal_data <- create_calibration_curve(test_preds_raw, y_outer_test, bins = 10)
+  calibrated_cal_data <- create_calibration_curve(test_preds_calibrated, y_outer_test, bins = 10)
+  
+  # Plot
+  cal_plot <- plot_calibration_curve(
+    original_cal_data, 
+    calibrated_cal_data,
+    title = paste("Calibration Curve - Fold", outer_fold)
+  )
+  
+  # Store calibration data
+  calibration_curves[[outer_fold]] <- list(
+    original = original_cal_data,
+    calibrated = calibrated_cal_data,
+    plot = cal_plot
+  )
+  
+  # Calculate optimal threshold and metrics
+  optimal_threshold <- find_optimal_threshold(test_preds_calibrated, y_outer_test)
+  test_metrics <- calculate_metrics(test_preds_calibrated, y_outer_test, optimal_threshold)
+  
+  # Store results
+  best_models[[outer_fold]] <- final_model
+  best_platt_models[[outer_fold]] <- platt_model
+  test_predictions[[outer_fold]] <- test_preds_calibrated
+  test_actual[[outer_fold]] <- y_outer_test
+  outer_fold_results[[outer_fold]] <- list(
+    metrics = test_metrics,
+    threshold = optimal_threshold,
+    best_params = best_inner_params
+  )
+  
+  # Display test results
+  cat("\nOuter Fold", outer_fold, "Test Results:\n")
+  print(test_metrics)
+  
+  # Save calibration curve for fold
+  dir.create("xgboost_nested_cv_results/plots", showWarnings = FALSE)
+  ggsave(
+    filename = paste0("xgboost_nested_cv_results/plots/calibration_curve_fold_", outer_fold, ".png"),
+    plot = cal_plot,
+    width = 8,
+    height = 6
+  )
+  
+  # Calculate SHAP values for this fold
+  cat("\nCalculating SHAP values for fold", outer_fold, "...\n")
+  
+  # Option to limit to sample of data
+  if (nrow(X_outer_test) > 10000) {
+    sample_idx <- sample(1:nrow(X_outer_test), 10000)
+    X_test_sample <- X_outer_test[sample_idx, ]
+  } else {
+    X_test_sample <- X_outer_test
+  }
+  
+  tryCatch({
+    # Calculate SHAP values
+    shap_values <- shap.values(xgb_model = final_model, X_train = X_test_sample)
+    
+    # Prepare for analysis
+    shap_data <- shap.prep(shap_contrib = shap_values$shap_score, X_train = X_test_sample)
+    
+    # Store SHAP data
+    shap_values_all[[outer_fold]] <- shap_data
+    
+    # Calculate and store importance
+    importance <- shap.importance(shap_data)
+    shap_importance_all[[outer_fold]] <- importance
+    
+    # Display top features
+    cat("\nTop 10 important features for fold", outer_fold, ":\n")
+    print(head(importance, 10))
+  }, error = function(e) {
+    cat("Error calculating SHAP values:", e$message, "\n")
+  })
+}
+
+# Combine all test predictions and actual values
+combined_predictions <- unlist(test_predictions)
+combined_actual <- unlist(test_actual)
+combined_original_preds <- unlist(original_pred_all)
+
+# Overall calibration
+overall_original_cal <- create_calibration_curve(combined_original_preds, combined_actual, bins = 15)
+overall_calibrated_cal <- create_calibration_curve(combined_predictions, combined_actual, bins = 15)
+
+# Overall calibration evaluation
+overall_cal_plot <- plot_calibration_curve(
+  overall_original_cal,
+  overall_calibrated_cal,
+  title = "Overall Calibration Curve (All Folds)"
+)
+
+ggsave(
+  filename = "xgboost_nested_cv_results/plots/overall_calibration_curve.png",
+  plot = overall_cal_plot,
+  width = 10,
+  height = 8
+)
+
+# Plot
+fold_calibration_data <- data.frame()
+
+for (fold in 1:outer_folds) {
+  if (!is.null(calibration_curves[[fold]])) {
+    orig_data <- calibration_curves[[fold]]$original
+    orig_data$type <- "Original"
+    orig_data$fold <- paste("Fold", fold)
+    
+    cal_data <- calibration_curves[[fold]]$calibrated
+    cal_data$type <- "Calibrated"
+    cal_data$fold <- paste("Fold", fold)
+    
+    fold_calibration_data <- rbind(fold_calibration_data, orig_data, cal_data)
+  }
+}
+
+if (nrow(fold_calibration_data) > 0) {
+  facet_cal_plot <- ggplot() +
+    # Add reference line
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+    
+    # Add curves
+    geom_line(data = fold_calibration_data, 
+              aes(x = pred_mean, y = actual_mean, color = type), 
+              size = 1) +
+    
+    # Add points
+    geom_point(data = fold_calibration_data, 
+               aes(x = pred_mean, y = actual_mean, color = type, size = n_samples)) +
+    
+    # Facet by fold
+    facet_wrap(~ fold, nrow = 2) +
+    
+    # Labels and theme
+    scale_color_manual(values = c("Original" = "red", "Calibrated" = "blue")) +
+    labs(
+      title = "Calibration Curves by Fold",
+      x = "Predicted Probability",
+      y = "Observed Frequency",
+      color = "Model",
+      size = "Sample Size"
+    ) +
+    theme_minimal() +
+    coord_equal() +  # Force 1:1 aspect ratio
+    xlim(0, 1) +
+    ylim(0, 1)
+  
+  ggsave(
+    filename = "xgboost_nested_cv_results/plots/all_folds_calibration_curves.png",
+    plot = facet_cal_plot,
+    width = 15,
+    height = 10
+  )
+}
+
+# Calculate final metrics on combined results
+final_threshold <- find_optimal_threshold(combined_predictions, combined_actual)
+final_metrics <- calculate_metrics(combined_predictions, combined_actual, final_threshold)
+
+# Calculate average metrics across folds
+avg_metrics <- matrix(0, nrow = 1, ncol = 7)
+colnames(avg_metrics) <- c("Accuracy", "Specificity", "Recall", "Precision", "F1_Score", "AUC", "Brier_Score")
+
+for (i in 1:outer_folds) {
+  avg_metrics <- avg_metrics + outer_fold_results[[i]]$metrics
+}
+avg_metrics <- avg_metrics / outer_folds
+
+# Compare Brier scores before and after calibration
+brier_score_original <- mean((combined_original_preds - combined_actual)^2)
+brier_score_calibrated <- mean((combined_predictions - combined_actual)^2)
+
+cat("\n---------- CALIBRATION RESULTS ----------\n")
+cat("Brier Score (Original):", brier_score_original, "\n")
+cat("Brier Score (Calibrated):", brier_score_calibrated, "\n")
+cat("Improvement:", (brier_score_original - brier_score_calibrated) / brier_score_original * 100, "%\n")
+
+# Print final results
+cat("\n---------- FINAL RESULTS ----------\n")
+cat("\nAverage Metrics Across All Folds:\n")
+print(avg_metrics)
+cat("\nCombined Test Metrics:\n")
+print(final_metrics)
+
+# Combine SHAP importance across all folds
+combined_importance <- data.frame()
+
+for (i in 1:length(shap_importance_all)) {
+  if (!is.null(shap_importance_all[[i]])) {
+    importance_df <- as.data.frame(shap_importance_all[[i]])
+    importance_df$fold <- i
+    combined_importance <- rbind(combined_importance, importance_df)
+  }
+}
+
+# Calculate average importance across folds
+avg_importance <- NULL
+if (nrow(combined_importance) > 0) {
+  avg_importance <- aggregate(mean_abs_shap ~ variable, data = combined_importance, FUN = mean)
+  avg_importance <- avg_importance[order(-avg_importance$mean_abs_shap), ]
+  
+  cat("\nAverage SHAP Feature Importance Across All Folds:\n")
+  print(head(avg_importance, 20))
+}
+
+# Save results
+cat("\n---------- SAVING RESULTS ----------\n")
+
+# Create folder for results
+dir.create("xgboost_nested_cv_results", showWarnings = FALSE)
+
+# Save all results
+saveRDS(outer_fold_results, "xgboost_nested_cv_results/outer_fold_results.rds")
+saveRDS(best_models, "xgboost_nested_cv_results/best_models.rds")
+saveRDS(best_platt_models, "xgboost_nested_cv_results/best_platt_models.rds")
+saveRDS(test_predictions, "xgboost_nested_cv_results/test_predictions.rds")
+saveRDS(test_actual, "xgboost_nested_cv_results/test_actual.rds")
+saveRDS(shap_values_all, "xgboost_nested_cv_results/shap_values_all.rds")
+saveRDS(shap_importance_all, "xgboost_nested_cv_results/shap_importance_all.rds")
+saveRDS(avg_importance, "xgboost_nested_cv_results/avg_importance.rds")
+saveRDS(combined_importance, "xgboost_nested_cv_results/combined_importance.rds")
+saveRDS(avg_metrics, "xgboost_nested_cv_results/avg_metrics.rds")
+saveRDS(final_metrics, "xgboost_nested_cv_results/final_metrics.rds")
+saveRDS(calibration_curves, "xgboost_nested_cv_results/calibration_curves.rds")
+saveRDS(overall_original_cal, "xgboost_nested_cv_results/overall_original_cal.rds")
+saveRDS(overall_calibrated_cal, "xgboost_nested_cv_results/overall_calibrated_cal.rds")
+
+# Predictions dataframe
+predictions_df <- data.frame(
+  actual = combined_actual,
+  predicted_original = combined_original_preds,
+  predicted_calibrated = combined_predictions
+)
+saveRDS(predictions_df, "xgboost_nested_cv_results/predictions_df.rds")
+
+# Create SHAP plots
+cat("\n---------- CREATING SHAP PLOTS ----------\n")
+
+# Create a folder for plots
+dir.create("xgboost_nested_cv_results/plots", showWarnings = FALSE)
+
+# Get top features for plotting
+top_features <- head(avg_importance$variable, 10)
+
+# Combine SHAP values from all folds for plotting
+combined_shap_df <- data.frame()
+
+for (i in 1:length(shap_values_all)) {
+  if (!is.null(shap_values_all[[i]])) {
+    fold_shap <- shap_values_all[[i]]
+    fold_shap$fold <- i
+    combined_shap_df <- rbind(combined_shap_df, fold_shap)
+  }
+}
+
+# Save combined SHAP values
+saveRDS(combined_shap_df, "xgboost_nested_cv_results/combined_shap_df.rds")
+
+# Create individual SHAP dependency plots
+for (feature in top_features) {
+  tryCatch({
+    # Filter data for this feature
+    feature_data <- combined_shap_df[combined_shap_df$variable == feature, ]
+    
+    # Create the plot
+    p <- ggplot(feature_data, aes(x = rfvalue, y = value)) +
+      geom_point(aes(color = value), alpha = 0.7) +
+      geom_smooth(method = "loess", se = TRUE, color = "darkred", fill = "pink") +
+      scale_color_gradient(low = "blue", high = "red") +
+      theme_minimal() +
+      labs(
+        title = paste0("SHAP Dependency Plot - ", feature),
+        x = "Feature Value",
+        y = "SHAP Value",
+        color = "SHAP Impact"
+      )
+    
+    # Save the plot
+    ggsave(
+      filename = paste0("xgboost_nested_cv_results/plots/shap_", gsub("[^a-zA-Z0-9]", "_", feature), ".png"),
+      plot = p,
+      width = 10,
+      height = 6
+    )
+  }, error = function(e) {
+    cat("Error creating plot for feature", feature, ":", e$message, "\n")
+  })
+}
+
+# Create SHAP summary plot
+if (!is.null(avg_importance)) {
+  # Select top 20 features
+  top_20 <- head(avg_importance, 20)
+  
+  # Create bar plot
+  p <- ggplot(top_20, aes(x = reorder(variable, mean_abs_shap), y = mean_abs_shap)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    coord_flip() +
+    theme_minimal() +
+    labs(
+      title = "SHAP Feature Importance",
+      x = "Feature",
+      y = "Mean |SHAP Value|"
+    )
+  
+  # Save plot
+  ggsave(
+    filename = "xgboost_nested_cv_results/plots/shap_importance_summary.png",
+    plot = p,
+    width = 12,
+    height = 8
+  )
+}
+
+# Create combined grid of top 10 SHAP dependency plots
+dependency_plots <- list()
+
+for (i in 1:min(length(top_features), 10)) {
+  feature <- top_features[i]
+  tryCatch({
+    # Filter data for this feature
+    feature_data <- combined_shap_df[combined_shap_df$variable == feature, ]
+    
+    # Create the plot
+    p <- ggplot(feature_data, aes(x = rfvalue, y = value)) +
+      geom_point(aes(color = value), alpha = 0.5, size = 1) +
+      geom_smooth(method = "loess", se = TRUE, color = "darkred", fill = "pink") +
+      scale_color_gradient(low = "blue", high = "red") +
+      theme_minimal() +
+      theme(
+        plot.title = element_text(size = 10),
+        axis.title = element_text(size = 9),
+        legend.position = "none"
+      ) +
+      labs(
+        title = paste0(feature),
+        x = "Feature Value",
+        y = "SHAP Value"
+      )
+    
+    dependency_plots[[i]] <- p
+  }, error = function(e) {
+    cat("Error creating grid plot for feature", feature, ":", e$message, "\n")
+  })
+}
+
+# Create a grid of plots
+if (length(dependency_plots) > 0) {
+  grid_plot <- gridExtra::grid.arrange(
+    grobs = dependency_plots,
+    ncol = 2
+  )
+  
+  # Save the combined plot
+  ggsave(
+    "xgboost_nested_cv_results/plots/top_10_shap_dependency_grid.png",
+    plot = grid_plot,
+    width = 15,
+    height = 20
+  )
+}
+
+# Compare original vs calibrated predictions
+reliability_plot <- ggplot() +
+  # Reference line
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+  
+  # Add calibration curves with confidence bands
+  geom_ribbon(data = overall_original_cal, 
+              aes(x = pred_mean, ymin = lower_bound, ymax = upper_bound),
+              fill = "red", alpha = 0.2) +
+  geom_ribbon(data = overall_calibrated_cal, 
+              aes(x = pred_mean, ymin = lower_bound, ymax = upper_bound),
+              fill = "blue", alpha = 0.2) +
+  
+  # Add lines
+  geom_line(data = overall_original_cal, 
+            aes(x = pred_mean, y = actual_mean, color = "Original"), 
+            size = 1.2) +
+  geom_line(data = overall_calibrated_cal, 
+            aes(x = pred_mean, y = actual_mean, color = "Calibrated"), 
+            size = 1.2) +
+  
+  # Add points
+  geom_point(data = overall_original_cal, 
+             aes(x = pred_mean, y = actual_mean, color = "Original", size = n_samples)) +
+  geom_point(data = overall_calibrated_cal, 
+             aes(x = pred_mean, y = actual_mean, color = "Calibrated", size = n_samples)) +
+  
+  # Labels and theme
+  scale_color_manual(name = "Model", 
+                     values = c("Original" = "red", "Calibrated" = "blue")) +
+  labs(
+    title = "Reliability Diagram - Original vs. Calibrated Predictions",
+    subtitle = paste("Brier Score - Original:", round(brier_score_original, 4), 
+                     "Calibrated:", round(brier_score_calibrated, 4)),
+    x = "Predicted Probability",
+    y = "Observed Frequency",
+    size = "Number of Samples"
+  ) +
+  theme_minimal() +
+  coord_equal() +
+  xlim(0, 1) +
+  ylim(0, 1)
+
+# Save reliability
+ggsave(
+  "xgboost_nested_cv_results/plots/reliability_diagram.png",
+  plot = reliability_plot,
+  width = 10,
+  height = 8
+)
+
+# ---------- FAIRNESS ANALYSIS ----------
+
+# Create directory for fairness analysis
+dir.create("xgboost_nested_cv_results/fairness", showWarnings = FALSE)
+
+# Function to calculate fairness metrics
+calculate_fairness_metrics <- function(actual, predicted, threshold, demographic_values, demographic_name) {
+  # Create result dataframe
+  fairness_results <- data.frame(
+    Demographic_Variable = character(),
+    Demographic_Value = character(),
+    Sample_Size = integer(),
+    Actual_Outcome_Rate = numeric(),
+    Predicted_Outcome_Rate = numeric(),
+    Accuracy = numeric(),
+    Specificity = numeric(),
+    Recall = numeric(),
+    Precision = numeric(),
+    F1_Score = numeric(),
+    AUC = numeric(),
+    Brier_Score = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Analyze each unique demographic value
+  for (value in unique(demographic_values)) {
+    # Filter data for this demographic group
+    idx <- which(demographic_values == value)
+    if (length(idx) < 10) next  # Skip groups that are too small
+    
+    group_actual <- actual[idx]
+    group_predicted <- predicted[idx]
+    
+    # Calculate actual outcome rate
+    actual_rate <- mean(group_actual)
+    
+    # Calculate predicted outcome rate using the provided threshold
+    pred_outcomes <- ifelse(group_predicted > threshold, 1, 0)
+    predicted_rate <- mean(pred_outcomes)
+    
+    # Calculate metrics using the provided threshold
+    metrics <- calculate_metrics(group_predicted, group_actual, threshold)
+    
+    # Add to results
+    fairness_results <- rbind(
+      fairness_results,
+      data.frame(
+        Demographic_Variable = demographic_name,
+        Demographic_Value = as.character(value),
+        Sample_Size = length(idx),
+        Actual_Outcome_Rate = actual_rate,
+        Predicted_Outcome_Rate = predicted_rate,
+        Accuracy = metrics[1],
+        Specificity = metrics[2],
+        Recall = metrics[3],
+        Precision = metrics[4],
+        F1_Score = metrics[5],
+        AUC = metrics[6],
+        Brier_Score = metrics[7],
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+  
+  return(fairness_results)
+}
+
+# Combine all test data with demographic information
+all_test_indices <- unlist(lapply(1:outer_folds, function(i) outer_fold_indices[[i]]))
+demographic_data <- data.frame(
+  SEX = as.character(X[all_test_indices, "SEX"]),
+  ETHNICITY_HISPANIC = as.character(X[all_test_indices, "ETHNICITY_HISPANIC"]),
+  RACE_COMBINED_NUM = as.character(X[all_test_indices, "RACE_COMBINED_NUM"])
+)
+
+# Test data
+all_test_indices <- integer(0)
+for (fold in 1:outer_folds) {
+  outer_test_idx <- setdiff(1:length(y), outer_fold_indices[[fold]])
+  all_test_indices <- c(all_test_indices, outer_test_idx)
+}
+
+# Get test data with corresponding demographic information
+demographic_data <- data.frame(
+  SEX = as.character(X[all_test_indices, "SEX"]),
+  ETHNICITY_HISPANIC = as.character(X[all_test_indices, "ETHNICITY_HISPANIC"]),
+  RACE_COMBINED_NUM = as.character(X[all_test_indices, "RACE_COMBINED_NUM"])
+)
+
+# Map to folds
+fairness_data <- data.frame(
+  Actual = unlist(test_actual),
+  Predicted = unlist(test_predictions),
+  Fold = rep(1:outer_folds, sapply(test_actual, length)),
+  SEX = demographic_data$SEX,
+  ETHNICITY_HISPANIC = demographic_data$ETHNICITY_HISPANIC,
+  RACE_COMBINED_NUM = demographic_data$RACE_COMBINED_NUM
+)
+
+# Calculate metrics for each demographic variable using fold-specific thresholds
+fairness_results_all <- data.frame()
+
+# For each fold
+for (fold in 1:outer_folds) {
+  # Get data
+  fold_data <- fairness_data[fairness_data$Fold == fold, ]
+  
+  # Get threshold
+  fold_threshold <- outer_fold_results[[fold]]$threshold
+  
+  cat(sprintf("\nAnalyzing fairness for Fold %d (Threshold: %.4f)\n", fold, fold_threshold))
+  
+  # Calculate metrics for SEX
+  sex_results <- calculate_fairness_metrics(
+    fold_data$Actual, 
+    fold_data$Predicted, 
+    fold_threshold, 
+    fold_data$SEX, 
+    "SEX"
+  )
+  sex_results$Fold <- fold
+  
+  # Calculate metrics for ETHNICITY_HISPANIC
+  ethnicity_results <- calculate_fairness_metrics(
+    fold_data$Actual, 
+    fold_data$Predicted, 
+    fold_threshold, 
+    fold_data$ETHNICITY_HISPANIC, 
+    "ETHNICITY_HISPANIC"
+  )
+  ethnicity_results$Fold <- fold
+  
+  # Calculate metrics for RACE_COMBINED_NUM
+  race_results <- calculate_fairness_metrics(
+    fold_data$Actual, 
+    fold_data$Predicted, 
+    fold_threshold, 
+    fold_data$RACE_COMBINED_NUM, 
+    "RACE_COMBINED_NUM"
+  )
+  race_results$Fold <- fold
+  
+  # Combine results
+  fold_results <- rbind(sex_results, ethnicity_results, race_results)
+  fairness_results_all <- rbind(fairness_results_all, fold_results)
+}
+
+# Calculate overall fairness metrics (across all folds)
+cat("\nCalculating overall fairness metrics across all folds\n")
+
+# Get the optimal threshold across all folds
+overall_threshold <- find_optimal_threshold(fairness_data$Predicted, fairness_data$Actual)
+
+# Calculate metrics for SEX
+overall_sex_results <- calculate_fairness_metrics(
+  fairness_data$Actual, 
+  fairness_data$Predicted, 
+  overall_threshold, 
+  fairness_data$SEX, 
+  "SEX"
+)
+overall_sex_results$Fold <- "Overall"
+
+# Calculate metrics for ETHNICITY_HISPANIC
+overall_ethnicity_results <- calculate_fairness_metrics(
+  fairness_data$Actual, 
+  fairness_data$Predicted, 
+  overall_threshold, 
+  fairness_data$ETHNICITY_HISPANIC, 
+  "ETHNICITY_HISPANIC"
+)
+overall_ethnicity_results$Fold <- "Overall"
+
+# Calculate metrics for RACE_COMBINED_NUM
+overall_race_results <- calculate_fairness_metrics(
+  fairness_data$Actual, 
+  fairness_data$Predicted, 
+  overall_threshold, 
+  fairness_data$RACE_COMBINED_NUM, 
+  "RACE_COMBINED_NUM"
+)
+overall_race_results$Fold <- "Overall"
+
+# Combine all results
+final_fairness_results <- rbind(
+  fairness_results_all,
+  overall_sex_results,
+  overall_ethnicity_results,
+  overall_race_results
+)
+
+# Save results to CSV
+write.csv(final_fairness_results, "xgboost_nested_cv_results/fairness/fairness_metrics.csv", row.names = FALSE)
+
+# Save results to Excel
+if (requireNamespace("openxlsx", quietly = TRUE)) {
+  library(openxlsx)
+  
+  # Create a workbook
+  wb <- createWorkbook()
+  
+  # Add sheet for overall results
+  addWorksheet(wb, "Overall Fairness")
+  overall_results <- final_fairness_results[final_fairness_results$Fold == "Overall", ]
+  writeData(wb, "Overall Fairness", overall_results)
+  
+  # Add sheet for each demographic variable
+  demographic_vars <- c("SEX", "ETHNICITY_HISPANIC", "RACE_COMBINED_NUM")
+  
+  for (var in demographic_vars) {
+    sheet_name <- paste0(var, "_by_Fold")
+    addWorksheet(wb, sheet_name)
+    var_results <- final_fairness_results[final_fairness_results$Demographic_Variable == var & 
+                                            final_fairness_results$Fold != "Overall", ]
+    writeData(wb, sheet_name, var_results)
+  }
+  
+  # Create a summary sheet with fairness disparities
+  addWorksheet(wb, "Fairness Disparities")
+  
+  # Calculate disparities for each demographic variable
+  disparity_results <- data.frame()
+  
+  for (var in demographic_vars) {
+    # Get overall results
+    var_results <- overall_results[overall_results$Demographic_Variable == var, ]
+    
+    if (nrow(var_results) >= 2) {
+      # Calculate min, max, and range
+      for (metric in c("Actual_Outcome_Rate", "Predicted_Outcome_Rate", "Recall", "Precision", "AUC", "Brier_Score")) {
+        min_val <- min(var_results[[metric]])
+        max_val <- max(var_results[[metric]])
+        range_val <- max_val - min_val
+        
+        disparity_results <- rbind(
+          disparity_results,
+          data.frame(
+            Demographic_Variable = var,
+            Metric = metric,
+            Min_Value = min_val,
+            Max_Value = max_val,
+            Absolute_Disparity = range_val,
+            Relative_Disparity = ifelse(min_val > 0, max_val / min_val, NA),
+            Min_Group = var_results$Demographic_Value[which.min(var_results[[metric]])],
+            Max_Group = var_results$Demographic_Value[which.max(var_results[[metric]])],
+            stringsAsFactors = FALSE
+          )
+        )
+      }
+    }
+  }
+  
+  writeData(wb, "Fairness Disparities", disparity_results)
+  
+  # Add visualization sheets
+  key_metrics <- c("Actual_Outcome_Rate", "Predicted_Outcome_Rate", "AUC", "Brier_Score")
+  
+  # Save the workbook
+  saveWorkbook(wb, "xgboost_nested_cv_results/fairness/fairness_analysis.xlsx", overwrite = TRUE)
+  
+  cat("\nFairness analysis saved to Excel file: xgboost_nested_cv_results/fairness/fairness_analysis.xlsx\n")
+} else {
+  cat("\nPackage 'openxlsx' not available. Results saved to CSV only.\n")
+  cat("Install 'openxlsx' package to generate Excel output.\n")
+}
+
+# Create fairness visualization plots
+if (requireNamespace("ggplot2", quietly = TRUE)) {
+  # Create plots directory if it doesn't exist
+  dir.create("xgboost_nested_cv_results/fairness/plots", showWarnings = FALSE)
+  
+  # Only use overall results for plotting
+  plot_data <- final_fairness_results[final_fairness_results$Fold == "Overall", ]
+  
+  # Function to create bar plots for a metric across demographic groups
+  create_fairness_plot <- function(data, metric_name, metric_label, output_filename) {
+    p <- ggplot(data, aes(x = Demographic_Value, y = .data[[metric_name]], fill = Demographic_Variable)) +
+      geom_bar(stat = "identity", position = "dodge") +
+      facet_wrap(~ Demographic_Variable, scales = "free_x", ncol = 1) +
+      theme_minimal() +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none"
+      ) +
+      labs(
+        title = paste("Fairness Analysis -", metric_label),
+        x = "Demographic Group",
+        y = metric_label,
+        caption = "Based on test data from all CV folds"
+      ) +
+      geom_text(aes(label = sprintf("%.3f", .data[[metric_name]])), 
+                position = position_dodge(width = 0.9), 
+                vjust = -0.5, 
+                size = 3)
+    
+    # Save the plot
+    ggsave(
+      filename = output_filename,
+      plot = p,
+      width = 10,
+      height = 8
+    )
+    
+    return(p)
+  }
+  
+  # Create plots for key metrics
+  metrics_to_plot <- list(
+    "Actual_Outcome_Rate" = "Actual Outcome Rate",
+    "Predicted_Outcome_Rate" = "Predicted Outcome Rate",
+    "AUC" = "AUC",
+    "Recall" = "Sensitivity/Recall",
+    "Specificity" = "Specificity",
+    "Precision" = "Precision",
+    "Brier_Score" = "Brier Score"
+  )
+  
+  fairness_plots <- list()
+  
+  for (metric_name in names(metrics_to_plot)) {
+    plot_filename <- paste0(
+      "xgboost_nested_cv_results/fairness/plots/fairness_", 
+      tolower(gsub("_", "", metric_name)), 
+      ".png"
+    )
+    
+    fairness_plots[[metric_name]] <- create_fairness_plot(
+      plot_data, 
+      metric_name, 
+      metrics_to_plot[[metric_name]],
+      plot_filename
+    )
+  }
+  
+  # Create a plot comparing actual vs predicted outcome rates
+  comparison_data <- reshape2::melt(
+    plot_data[, c("Demographic_Variable", "Demographic_Value", "Actual_Outcome_Rate", "Predicted_Outcome_Rate")],
+    id.vars = c("Demographic_Variable", "Demographic_Value"),
+    variable.name = "Rate_Type",
+    value.name = "Rate"
+  )
+  
+  comparison_plot <- ggplot(comparison_data, aes(x = Demographic_Value, y = Rate, fill = Rate_Type)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    facet_wrap(~ Demographic_Variable, scales = "free_x", ncol = 1) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    ) +
+    labs(
+      title = "Comparison of Actual vs Predicted Outcome Rates",
+      x = "Demographic Group",
+      y = "Rate",
+      fill = "Rate Type"
+    ) +
+    scale_fill_manual(
+      values = c("Actual_Outcome_Rate" = "darkblue", "Predicted_Outcome_Rate" = "orange"),
+      labels = c("Actual_Outcome_Rate" = "Actual", "Predicted_Outcome_Rate" = "Predicted")
+    )
+  
+  ggsave(
+    filename = "xgboost_nested_cv_results/fairness/plots/actual_vs_predicted_rates.png",
+    plot = comparison_plot,
+    width = 10,
+    height = 8
+  )
+  
+  cat("\nFairness visualization plots saved to: xgboost_nested_cv_results/fairness/plots/\n")
+}
+
+# ---------- DEMOGRAPHIC-SPECIFIC SHAP ANALYSIS ----------
+
+# Function to get top SHAP values for a specific demographic group
+get_top_shap_by_demographic <- function(shap_data, demographic_values, demographic_value, n_top = 20) {
+  # Filter SHAP data for the demographic group
+  group_indices <- which(demographic_values == demographic_value)
+  
+  if (length(group_indices) < 10) {
+    cat("Too few samples for demographic value:", demographic_value, "\n")
+    return(NULL)
+  }
+  
+  # Extract unique variables
+  all_variables <- unique(shap_data$variable)
+  
+  # Calculate mean absolute SHAP values
+  feature_importance <- data.frame(
+    variable = character(),
+    mean_abs_shap = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (feature in all_variables) {
+    # Get SHAP values for this feature in this demographic group
+    feature_indices <- which(shap_data$variable == feature)
+    group_feature_indices <- intersect(feature_indices, group_indices)
+    
+    if (length(group_feature_indices) > 0) {
+      mean_abs_shap <- mean(abs(shap_data$value[group_feature_indices]))
+      
+      feature_importance <- rbind(
+        feature_importance,
+        data.frame(
+          variable = feature,
+          mean_abs_shap = mean_abs_shap,
+          stringsAsFactors = FALSE
+        )
+      )
+    }
+  }
+  
+  # Sort by importance and get top N
+  if (nrow(feature_importance) > 0) {
+    feature_importance <- feature_importance[order(-feature_importance$mean_abs_shap), ]
+    top_features <- head(feature_importance, n_top)
+    
+    # Add demographic info
+    top_features$demographic_variable <- demographic_name
+    top_features$demographic_value <- demographic_value
+    
+    return(top_features)
+  } else {
+    return(NULL)
+  }
+}
+
+# Create directory for SHAP analysis
+dir.create("xgboost_nested_cv_results/shap_demographics", showWarnings = FALSE)
+
+# Process SHAP values by demographic group
+demographic_shap_results <- list()
+
+# Load combined SHAP data
+combined_shap_df <- readRDS("xgboost_nested_cv_results/combined_shap_df.rds")
+
+if (!is.null(combined_shap_df) && nrow(combined_shap_df) > 0) {
+  # Create a mapping of fold indices to row indices in the SHAP data
+  fold_mapping <- list()
+  for (fold in unique(combined_shap_df$fold)) {
+    fold_indices <- which(combined_shap_df$fold == fold)
+    fold_mapping[[as.character(fold)]] <- fold_indices
+  }
+  
+  # For each fold, map the SHAP data to demographic information
+  shap_demographic_data <- data.frame()
+  
+  for (fold in 1:outer_folds) {
+    # Get outer test data for this fold
+    outer_test_idx <- setdiff(1:length(y), outer_fold_indices[[fold]])
+    
+    # Get demographic data for these test data
+    fold_demographic_data <- data.frame(
+      SEX = as.character(X[outer_test_idx, "SEX"]),
+      ETHNICITY_HISPANIC = as.character(X[outer_test_idx, "ETHNICITY_HISPANIC"]),
+      RACE_COMBINED_NUM = as.character(X[outer_test_idx, "RACE_COMBINED_NUM"]),
+      fold = fold,
+      row_index = seq_along(outer_test_idx)
+    )
+    
+    if (as.character(fold) %in% names(fold_mapping)) {
+      fold_shap_indices <- fold_mapping[[as.character(fold)]]
+      
+      unique_instances <- length(unique(combined_shap_df$ID[fold_shap_indices]))
+      
+      # If not all test samples were used for SHAP, select a subset
+      if (unique_instances < nrow(fold_demographic_data)) {
+        # Since we don't know which specific samples were used, take the first N
+        fold_demographic_data <- fold_demographic_data[1:unique_instances, ]
+      }
+      
+      shap_demographic_data <- rbind(shap_demographic_data, fold_demographic_data)
+    }
+  }
+  
+  # Create mapping from SHAP data to demographic info
+  shap_with_demographics <- merge(
+    combined_shap_df,
+    shap_demographic_data,
+    by.x = c("fold", "ID"),
+    by.y = c("fold", "row_index"),
+    all.x = FALSE
+  )
+  
+  if (nrow(shap_with_demographics) > 0) {
+    # Create Excel workbook
+    if (requireNamespace("openxlsx", quietly = TRUE)) {
+      library(openxlsx)
+      
+      wb <- createWorkbook()
+      addWorksheet(wb, "Overview")
+      
+      # Demographics to analyze
+      demographic_vars <- c("SEX", "ETHNICITY_HISPANIC", "RACE_COMBINED_NUM")
+      
+      # Process each demographic variable
+      for (demographic_name in demographic_vars) {
+        cat(sprintf("\nAnalyzing SHAP values for demographic variable: %s\n", demographic_name))
+        
+        # Create a worksheet for this demographic
+        addWorksheet(wb, demographic_name)
+        
+        # Get unique values for this demographic
+        demographic_values <- shap_with_demographics[[demographic_name]]
+        unique_values <- unique(demographic_values)
+        
+        all_group_results <- data.frame()
+        
+        # For each demographic value
+        for (value in unique_values) {
+          cat(sprintf("  Processing demographic value: %s\n", value))
+          
+          # Get top SHAP features for this group
+          top_features <- get_top_shap_by_demographic(
+            shap_with_demographics, 
+            demographic_values, 
+            value, 
+            n_top = 20
+          )
+          
+          if (!is.null(top_features)) {
+            # Add rank information
+            top_features$rank <- 1:nrow(top_features)
+            
+            # Add to combined results
+            all_group_results <- rbind(
+              all_group_results,
+              data.frame(
+                Demographic_Value = value,
+                top_features,
+                stringsAsFactors = FALSE
+              )
+            )
+          }
+        }
+        
+        # Create a wide format for easier comparison
+        if (nrow(all_group_results) > 0) {
+          # Store in demographic-specific worksheet
+          writeData(wb, demographic_name, all_group_results)
+          
+          # Create a pivot-style view for comparison
+          comparison_data <- data.frame()
+          
+          for (value in unique_values) {
+            value_data <- all_group_results[all_group_results$Demographic_Value == value, ]
+            
+            if (nrow(value_data) > 0) {
+              # Select only top 20 features
+              value_top20 <- value_data[1:min(20, nrow(value_data)), c("rank", "variable", "mean_abs_shap")]
+              
+              # Rename columns to include demographic value
+              colnames(value_top20)[2:3] <- paste0(value, "_", colnames(value_top20)[2:3])
+              
+              # Initialize comparison data or merge with existing
+              if (nrow(comparison_data) == 0) {
+                comparison_data <- value_top20[, c("rank", colnames(value_top20)[2:3])]
+              } else {
+                comparison_data <- merge(
+                  comparison_data, 
+                  value_top20[, c("rank", colnames(value_top20)[2:3])],
+                  by = "rank",
+                  all = TRUE
+                )
+              }
+            }
+          }
+          
+          if (nrow(comparison_data) > 0) {
+            # Add this to a comparison worksheet
+            comparison_sheet_name <- paste0(demographic_name, "_Comparison")
+            addWorksheet(wb, comparison_sheet_name)
+            writeData(wb, comparison_sheet_name, comparison_data)
+          }
+        }
+        
+        # Store results for demographic variable
+        demographic_shap_results[[demographic_name]] <- all_group_results
+      }
+      
+      # Add overview information
+      overview_info <- data.frame(
+        Description = c(
+          "This workbook contains the top features by mean absolute SHAP value for each demographic group.",
+          "Each demographic variable has its own worksheet with detailed results.",
+          "Comparison worksheets show side-by-side rankings for easier comparison between groups.",
+          "SHAP values were calculated on test data from all cross-validation folds."
+        )
+      )
+      
+      writeData(wb, "Overview", overview_info)
+      
+      # Save workbook
+      saveWorkbook(
+        wb, 
+        "xgboost_nested_cv_results/shap_demographics/demographic_shap_values.xlsx", 
+        overwrite = TRUE
+      )
+      
+      cat("\nDemographic-specific SHAP analysis saved to: xgboost_nested_cv_results/shap_demographics/demographic_shap_values.xlsx\n")
+    } else {
+      cat("\nPackage 'openxlsx' not available. Cannot create Excel file.\n")
+      
+      # Save as RDS files instead
+      for (demographic_name in names(demographic_shap_results)) {
+        saveRDS(
+          demographic_shap_results[[demographic_name]],
+          paste0("xgboost_nested_cv_results/shap_demographics/", demographic_name, "_shap.rds")
+        )
+      }
+      
+      cat("Results saved as RDS files in the shap_demographics directory.\n")
+    }
+    
+    # Create SHAP comparison visualizations
+    if (requireNamespace("ggplot2", quietly = TRUE)) {
+      dir.create("xgboost_nested_cv_results/shap_demographics/plots", showWarnings = FALSE)
+      
+      for (demographic_name in names(demographic_shap_results)) {
+        group_results <- demographic_shap_results[[demographic_name]]
+        
+        if (!is.null(group_results) && nrow(group_results) > 0) {
+          # Get top 10 features across all groups
+          top_overall <- group_results %>%
+            group_by(variable) %>%
+            summarize(mean_importance = mean(mean_abs_shap)) %>%
+            arrange(desc(mean_importance)) %>%
+            head(10)
+          
+          # Filter data to include only these features
+          plot_data <- group_results[group_results$variable %in% top_overall$variable, ]
+          
+          if (nrow(plot_data) > 0) {
+            # Create comparison plot
+            p <- ggplot(plot_data, aes(x = reorder(variable, -mean_abs_shap), 
+                                       y = mean_abs_shap, 
+                                       fill = Demographic_Value)) +
+              geom_bar(stat = "identity", position = "dodge") +
+              theme_minimal() +
+              theme(
+                axis.text.x = element_text(angle = 45, hjust = 1),
+                plot.title = element_text(hjust = 0.5)
+              ) +
+              labs(
+                title = paste("Top Features by Mean |SHAP| Value:", demographic_name),
+                x = "Feature",
+                y = "Mean |SHAP| Value",
+                fill = demographic_name
+              )
+            
+            # Save plot
+            ggsave(
+              filename = paste0(
+                "xgboost_nested_cv_results/shap_demographics/plots/", 
+                demographic_name, 
+                "_top_features.png"
+              ),
+              plot = p,
+              width = 12,
+              height = 8
+            )
+          }
+        }
+      }
+    }
+  } else {
+    cat("\nCould not map SHAP values to demographic information.\n")
+  }
+} else {
+  cat("\nNo SHAP data available for demographic analysis.\n")
+}
